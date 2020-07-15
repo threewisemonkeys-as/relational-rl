@@ -14,23 +14,23 @@ import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from .models import RelationalActorCritic
+from models import RelationalActorCritic
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-dtype = torch.double
+dtype = torch.float32
 
 # Hyperparameters
+# Low values because of compute constraints
+# Used stride = 4
 EPOCHS = 200
-EPISODES_PER_EPOCH = 64
-POLICY_HIDDEN_LAYERS = 32
-VALUE_HIDDEN_LAYERS = 32
+EPISODES_PER_EPOCH = 20  # 64
 N_POLICY_UPDATES = 16
 N_VALUE_UPDATES = 16
 GAMMA = 0.99
 EPSILON = 0.1
 VALUE_FN_LEARNING_RATE = 1e-3
 POLICY_LEARNING_RATE = 3e-4
-MAX_TRAJ_LENGTH = 1000
+MAX_TRAJ_LENGTH = 10  # 1000
 
 
 class Trajectory:
@@ -80,36 +80,37 @@ class Trajectory:
 class PPO:
     def __init__(
         self,
-        env,
-        policy_hidden_layers=POLICY_HIDDEN_LAYERS,
-        value_hidden_layers=VALUE_HIDDEN_LAYERS,
+        env
     ):
         self.env = env
         if self.env.unwrapped.spec is not None:
             self.env_name = self.env.unwrapped.spec.id
         else:
             self.env_name = self.env.unwrapped.__class__.__name__
-        self.ac = RelationalActorCritic()
+        self.ac = RelationalActorCritic((3, env.observation_space.shape[0], env.observation_space.shape[1]), env.action_space.n, [8], 3, [4])
 
     def _update(self, batch, hp, policy_optim, value_optim, writer):
         # process batch
         obs = [torch.stack(traj.obs)[:-1] for traj in batch]
         disc_r = [traj.disc_r(hp["gamma"], normalize=True) for traj in batch]
         a = [torch.stack(traj.a) for traj in batch]
+
         with torch.no_grad():
-            v = [self.value(o) for o in obs]
+            v = [self.ac.forward(o.permute(0, 3, 1, 2))[1] for o in obs]  # [self.value(o) for o in obs]
             adv = [disc_r[i] - v[i] for i in range(len(batch))]
             old_logits = [torch.stack(traj.logits) for traj in batch]
+            # print(old_logits[0].squeeze(1).shape)
+            # print(a[0].shape)
             old_logprobs = [
-                -F.cross_entropy(old_logits[i], a[i]) for i in range(len(batch))
+                -F.cross_entropy(old_logits[i].squeeze(1), a[i].squeeze(-1)) for i in range(len(batch))
             ]
 
         # update policy
         for j in range(hp["n_policy_updates"]):
             policy_loss = torch.zeros(1, device=device, dtype=dtype, requires_grad=True)
             for i, traj in enumerate(batch):
-                curr_logits = self.policy(obs[i])
-                curr_logprobs = -F.cross_entropy(curr_logits, a[i])
+                curr_logits = self.ac.forward(obs[i].permute(0, 3, 1, 2))[0]  # self.policy(obs[i])
+                curr_logprobs = -F.cross_entropy(curr_logits, a[i].squeeze(-1))
                 ratio = torch.exp(curr_logprobs - old_logprobs[i])
                 clipped_ratio = torch.clamp(ratio, 1 - hp["epsilon"], 1 + hp["epsilon"])
                 policy_loss = (
@@ -126,7 +127,7 @@ class PPO:
         for j in range(hp["n_value_updates"]):
             value_loss = torch.zeros(1, device=device, dtype=dtype, requires_grad=True)
             for i in range(len(batch)):
-                v = self.value(obs[i]).view(-1)
+                v = self.ac(obs[i].permute(0, 3, 1, 2))[1].squeeze(-1)
                 value_loss = value_loss + F.mse_loss(v, disc_r[i])
             value_loss = value_loss / len(batch)
             value_optim.zero_grad()
@@ -170,10 +171,10 @@ class PPO:
         else:
             writer = None
 
-        self.policy.train()
-        self.value.train()
-        value_optim = torch.optim.Adam(self.value.parameters(), lr=value_lr)
-        policy_optim = torch.optim.Adam(self.policy.parameters(), lr=policy_lr)
+        # self.policy.train()
+        # self.value.train()
+        value_optim = torch.optim.Adam(self.ac.parameters(), lr=value_lr)
+        policy_optim = torch.optim.Adam(self.ac.parameters(), lr=policy_lr)
         rewards = []
         e = 0
 
@@ -199,7 +200,7 @@ class PPO:
                         ):
                             self.env.render()
 
-                        a_logits = self.policy(obs)
+                        a_logits = self.ac.forward(obs.permute(2, 0, 1).unsqueeze(0).float())[0]
                         a = torch.distributions.Categorical(logits=a_logits).sample()
 
                         obs, r, d, _ = self.env.step(a.item())
@@ -257,8 +258,9 @@ class PPO:
         """ Save model parameters """
         torch.save(
             {
-                "policy_state_dict": self.policy.state_dict(),
-                "value_state_dict": self.value.state_dict(),
+                "relational_ppo_state_dict": self.ac.state_dict()
+                # "policy_state_dict": self.policy.state_dict(),
+                # "value_state_dict": self.value.state_dict(),
             },
             path,
         )
@@ -269,8 +271,9 @@ class PPO:
         if path is None:
             path = f"./models/{self.__class__.__name__}_{self.env_name}.pt"
         checkpoint = torch.load(path)
-        self.policy.load_state_dict(checkpoint["policy_state_dict"])
-        self.value.load_state_dict(checkpoint["value_state_dict"])
+        self.ac.load_state_dict(checkpoint["relational_ppo_state_dict"])
+        # self.policy.load_state_dict(checkpoint["policy_state_dict"])
+        # self.value.load_state_dict(checkpoint["value_state_dict"])
         print(f"\nLoaded model parameters from {path}")
 
     def eval(self, episodes, render=False):
@@ -278,7 +281,6 @@ class PPO:
 
         print(f"\nEvaluating model for {episodes} episodes ...\n")
         start_time = datetime.datetime.now()
-        self.policy.eval()
         rewards = []
 
         for episode in range(episodes):
@@ -292,7 +294,7 @@ class PPO:
                 if render:
                     self.env.render()
 
-                logits = self.policy(observation)
+                logits = self.ac(observation.permute(2, 1, 0).unsqueeze(0))[0]
                 action = torch.distributions.Categorical(logits=logits).sample()
                 next_observation, reward, done, _ = self.env.step(action.item())
                 episode_rewards.append(float(reward))
@@ -319,7 +321,7 @@ if __name__ == "__main__":
 
     import gym
 
-    env = gym.make("CartPole-v1")
+    env = gym.make("MsPacman-v0")
     # env = gym.make("LunarLander-v2")
 
     # from pybullet_envs import bullet
