@@ -62,8 +62,8 @@ class RelationalActorCritic(nn.Module):
         device=None,
     ):
         super(RelationalActorCritic, self).__init__()
-        self.obs_shape = obs_shape
-        self.a_dim = a_dim
+        self.obs_shape = obs_shape  #env.observation_space.shape
+        self.a_dim = a_dim  # env.action_space.n
 
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -76,9 +76,11 @@ class RelationalActorCritic(nn.Module):
         conv_dims.append(feature_dim)
         conv_module_list = []
         for i in range(len(conv_dims) - 1):
-            conv_module_list.append(nn.Conv2d(conv_dims[i], conv_dims[i + 1], 2, 1))
+            conv_module_list.append(nn.Conv2d(conv_dims[i], conv_dims[i + 1], 8, 4))
             conv_module_list.append(nn.ReLU())
+            # conv_module_list.append(nn.MaxPool2d())
         self.conv = nn.Sequential(*conv_module_list)
+        # print(conv_module_list)
 
         var = torch.zeros(4, *obs_shape, requires_grad=False)
         var = self.conv(var)
@@ -133,8 +135,8 @@ class RelationalActorCritic(nn.Module):
 
 
 if __name__ == "__main__":
-    ac = RelationalActorCritic((3, 32, 32), 2, [8], 8, [8])
-    x = torch.randn(4, 3, 32, 32)
+    ac = RelationalActorCritic((3, 210, 160), 2, [8], 8, [8])
+    x = torch.randn(4, 3, 210, 160)
     pi_logits, b = ac(x)
     a = ac.sample_action(x)
-    print(a.shape, pi_logits.shape, b.shape)
+    print(a, pi_logits.shape, b.shape)
