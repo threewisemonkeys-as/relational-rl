@@ -59,28 +59,19 @@ class RelationalActorCritic(nn.Module):
         lin_dims,
         relational_hidden_dim=None,
         relational_output_dim=None,
-        device=None,
     ):
         super(RelationalActorCritic, self).__init__()
-        self.obs_shape = obs_shape  #env.observation_space.shape
+        self.obs_shape = obs_shape  # env.observation_space.shape
         self.a_dim = a_dim  # env.action_space.n
-
-        if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        elif type(device) == str:
-            self.device = torch.device(device)
-        else:
-            self.device = device
 
         conv_dims.insert(0, obs_shape[0])
         conv_dims.append(feature_dim)
         conv_module_list = []
         for i in range(len(conv_dims) - 1):
-            conv_module_list.append(nn.Conv2d(conv_dims[i], conv_dims[i + 1], 8, 4))
+            conv_module_list.append(nn.Conv2d(conv_dims[i], conv_dims[i + 1], 2, 1))
             conv_module_list.append(nn.ReLU())
-            # conv_module_list.append(nn.MaxPool2d())
+            conv_module_list.append(nn.MaxPool2d(2))
         self.conv = nn.Sequential(*conv_module_list)
-        # print(conv_module_list)
 
         var = torch.zeros(4, *obs_shape, requires_grad=False)
         var = self.conv(var)
@@ -106,7 +97,6 @@ class RelationalActorCritic(nn.Module):
         self.baseline_head = nn.Linear(a_dim, 1)
 
     def forward(self, x):
-        # import pdb; pdb.set_trace();
         x = self.conv(x)
         ncols = x.shape[-1]
         x = x.flatten(start_dim=-2).transpose(-1, -2)
