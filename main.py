@@ -4,7 +4,9 @@ import torch
 
 from ppo import PPO
 
-parser = argparse.ArgumentParser(description="PPO with relational inductive bias module.")
+parser = argparse.ArgumentParser(
+    description="PPO with relational inductive bias module."
+)
 
 parser.add_argument(
     "--env", "-e", type=str, default="Cartpole-v0", help="Gym environment."
