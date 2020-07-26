@@ -5,17 +5,56 @@ import matplotlib.pyplot as plt
 
 
 class Node:
-    def __init__(self, n_neighbors: int, n_actions: int) -> None:
-        self.m = torch.zeros(n_neighbors, n_actions)
-        self.new_m = torch.zeros(n_neighbors, n_actions)
-        self.a = 0
+    """Node for Deep Coordination Graph
+
+    Args:
+        n_nodes (int): number of nodes in the graph
+        n_actions (int): number of actions possible for an agent
+
+    Attributes:
+        m (torch.Tensor): Tensor with messages passed to node from every other node
+        m (torch.Tensor): Updated tensor with messages passed to node from every other node
+    """
+    def __init__(self, n_nodes: int, n_actions: int) -> None:
+        """[summary]
+
+        Args:
+            n_nodes (int): [description]
+            n_actions (int): [description]
+        """
+        self.m = torch.zeros(n_nodes, n_actions)
+        self.new_m = torch.zeros(n_nodes, n_actions)
 
 
 class DCG:
+    """[summary]
+
+    Args:
+        nodes (list[Node]): List of nodes in the graph
+        edges (list[tuple): List of edges as tuples of node indices
+        utility_hidden_dims (list[int]): List of hidden dims for utility mlp
+        payoff_hidden_dims (list[int]): List of hidden dims for payoff mlp
+        obs_dim (int): Size of observation
+        n_actions (int): Number of possible actions
+        iterations (int): Number of iterations to run message passing for each forward pass
+        state_hidden_dim (int): Size of hidden state
+
+    Attributes:
+        nodes (list[Node]): List of nodes in the graph
+        edges (list[tuple): List of edges as tuples of node indices
+        n_actions (int): Number of possible actions
+        iterations (int): Number of iterations to run message passing for each forward pass
+        n_nodes (int): Number of nodes in the graph
+        n_edges (int): Number of edges in the graph
+        state (torch.Tensor): Hidden state tensor
+        state_encoder (nn.Module): RRN to encode observations into hidden states over time
+        utility (nn.Module): MLP to compute the utility of each node from its hidden state
+        payoff (nn.Module): MLP to compute the payoff of each edge from the hidden states of nodes
+    """
     def __init__(
         self,
         nodes: list[Node],
-        neighbours: list[list[int]],
+        edges: list[tuple(int, int)],
         utility_hidden_dims: list[int],
         payoff_hidden_dims: list[int],
         obs_dim: int,
@@ -24,16 +63,13 @@ class DCG:
         state_hidden_dim: int,
     ) -> None:
         self.nodes = nodes
-        self.neighbours = neighbours
-        self.iterations = iterations
+        self.edges = edges
         self.n_actions = n_actions
+        self.iterations = iterations
 
         self.n_nodes = len(self.nodes)
-        self.n_edges = 0
-        for n in self.neighbours:
-            self.n_edges += len(n)
-        self.n_edges //= 2
-        self.actions = torch.zeros(self.n_nodes, n_actions)
+        self.n_edges = len(self.edges)
+        self.actions = torch.zeros(self.n_nodes, self.n_actions)
         self.state = torch.zeros(1, self.n_nodes, state_hidden_dim)
         self.state_encoder = nn.GRU(
             input_size=obs_dim + 1, hidden_size=state_hidden_dim
@@ -41,14 +77,7 @@ class DCG:
 
         # create utility network
         utility_hidden_dims = [state_hidden_dim, *utility_hidden_dims, n_actions]
-        module_list = []
-        for i in range(len(utility_hidden_dims) - 2):
-            module_list.append(
-                nn.Linear(utility_hidden_dims[i], utility_hidden_dims[i + 1])
-            )
-            module_list.append(nn.ReLU())
-        module_list.append(nn.Linear(utility_hidden_dims[-2], utility_hidden_dims[-1]))
-        self.utility = nn.Sequential(*module_list)
+        self.utility = self._create_mlp(utility_hidden_dims)
 
         # create payoff network
         payoff_hidden_dims = [
@@ -56,52 +85,115 @@ class DCG:
             *utility_hidden_dims,
             n_actions ** 2,
         ]
-        module_list = []
-        for i in range(len(payoff_hidden_dims) - 2):
-            module_list.append(
-                nn.Linear(payoff_hidden_dims[i], payoff_hidden_dims[i + 1])
-            )
-            module_list.append(nn.ReLU())
-        module_list.append(nn.Linear(payoff_hidden_dims[-2], payoff_hidden_dims[-1]))
-        self.payoff = nn.Sequential(*module_list)
+        self.payoff = self._create_mlp(payoff_hidden_dims)
+
+    def q(self, u: torch.Tensor, p: list[list[torch.Tensor]], a: torch.Tensor) -> torch.Tensor:
+        """Compute the Q value of given action
+
+        Args:
+            u (torch.Tensor): Utility values of each node
+            p (list[list[torch.Tensor]]): Payoff values for edges of each node
+            a (torch.Tensor): The action assigned to each node
+
+        Returns:
+            torch.Tensor: The computed Q value
+        """
+        # compute utility component
+        q = u[[i for i in range(len(a))], a].sum()
+
+        # compute payoff component
+        for e_idx, (i, j) in enumerate(self.edges):
+            q += p[e_idx][a[i], a[j]]
+
+        return q
 
     def forward(self, x: torch.Tensor) -> tuple(torch.Tensor, torch.Tensor):
+        """Compute the best set of actions given an observation
+
+        Args:
+            x (torch.Tensor): The observation
+
+        Returns:
+            tuple(torch.Tensor, torch.Tensor): The optimal actions and associated Q value
+        """
         # encode observation and previous actions into hidden state
         encoder_input = torch.cat([x.unsqueeze(0), self.actions.unsqueeze(0)], dim=-1)
         _, self.state = self.state_encoder(encoder_input, self.state)
+        self.actions = torch.zeros(self.n_nodes, self.n_actions)
 
         # compute utility values for all nodes
         u = (1 / self.n_nodes) * self.utility(self.state)
 
+        # compute payoff values for all nodes
+        p = []
+        for i, j in self.edges:
+            # compute payoffs for each edge
+            p_i_j = (1 / self.n_edges) * self.payoff(
+                self.state[[i, j]].view(-1)
+            ).view(self.n_actions, self.n_actions)
+            p_j_i = (1 / self.n_edges) * self.payoff(
+                self.state[[j, i]].view(-1)
+            ).view(self.n_actions, self.n_actions)
+            # compute avergae of both ways for symetry and permuation invariance
+            p[i].append((p_i_j + p_j_i) / 2)
+        p = torch.stack(p)
+
         # run message passing across the graph
+        q_max = torch.zeros(1)
         for _ in range(self.iterations):
-            for i, n_i in enumerate(self.nodes):
-                for j, n_j in enumerate(self.neighbours[i]):
 
-                    # compute payoffs for each edge
-                    p = (1 / self.n_edges) * self.payoff(
-                        self.state[[i, j]].view(-1)
-                    ).view(self.n_actions, self.n_actions)
+            # message passing is not backpropogated through
+            with torch.no_grad:
+                for e_idx, (i, j) in enumerate(self.edges):
+                    # compute message for i --> j
+                    m_i_j = u[i] + torch.sum(self.nodes[i].m, dim=0) - self.nodes[i].m[j]
+                    m_i_j = (m_i_j + p[e_idx].T).T
+                    m_i_j = torch.max(m_i_j, dim=0).values
+                    m_i_j -= m_i_j.mean()
+                    self.nodes[j].new_m[i] = m_i_j
 
-                    # compute messages
-                    m = u[i] + torch.sum(n_i.m, dim=0) - n_i.m[j]
-                    m = (m + p.T).T
-                    idx = self.neighbours[j].index(i)
-                    n_j.new_m[idx] = torch.max(m, dim=0).values
+                    # compute message for j --> i
+                    m_j_i = u[j] + torch.sum(self.nodes[j].m, dim=0) - self.nodes[j].m[i]
+                    m_j_i = m_j_i + p[e_idx]
+                    m_i_j = torch.max(m_j_i, dim=0).values
+                    m_i_j -= m_j_i.mean()
+                    self.nodes[i].new_m[j] = m_j_i
 
-            # update the messages for for all nodes
-            for n in self.nodes:
-                n.m = n.new_m
+                # update the messages for for all nodes
+                for n in self.nodes:
+                    n.m = n.new_m
 
-        # compute optimal action for all nodes and q value
-        q = torch.zeros
-        for i, n_i in enumerate(self.nodes):
-            t = torch.max((u[i] + torch.sum(n_i.m, dim=0)).view(-1), dim=0)
-            n_i.a = t.indices
-            q += t.values
-            self.actions[i] = n_i.a
+                # compute optimal action for all nodes and q value according to messages
+                a = torch.zeros_like(self.actions)
+                for i, n_i in enumerate(self.nodes):
+                    n_i.a = torch.argmax((u[i] + torch.sum(n_i.m, dim=0)).view(-1), dim=0)
+                    a[i] = n_i.a
 
-        return self.actions, q
+            # check if computed actions are the best so dar
+            q_real = self.q(u, p, a)
+            if q_real > q_max:
+                q_max = q_real
+                self.actions = a
+
+        return self.actions, q_max
+
+    def _create_mlp(self, hidden_dims: list[int]) -> nn.Module:
+        """Create MLP with given dimensions
+
+        Args:
+            hidden_dims (list[int]): list of hidden dimesions
+
+        Returns:
+            nn.Module: The created MLP
+        """
+        module_list = []
+        for i in range(len(hidden_dims) - 2):
+            module_list.append(
+                nn.Linear(hidden_dims[i], hidden_dims[i + 1])
+            )
+            module_list.append(nn.ReLU())
+        module_list.append(nn.Linear(hidden_dims[-2], hidden_dims[-1]))
+        return nn.Sequential(*module_list)
 
 
 class DCGAgent:
