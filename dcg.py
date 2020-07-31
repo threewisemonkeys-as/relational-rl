@@ -4,10 +4,11 @@ import copy
 from itertools import count
 from collections import deque
 from datetime import datetime
+import pdb
 import random
 
 import torch
-from torch import pdist
+from torch import ne
 import torch.nn as nn
 import numpy as np
 
@@ -25,18 +26,16 @@ class Node:
     """
 
     def __init__(self, n_nodes: int, n_actions: int) -> None:
-        """[summary]
-
-        Args:
-            n_nodes (int): [description]
-            n_actions (int): [description]
-        """
         self.m = torch.zeros(n_nodes, n_actions)
         self.new_m = torch.zeros(n_nodes, n_actions)
 
 
-class DCG:
-    """[summary]
+class DCG(nn.Module):
+    """Deep coordination graph
+
+    Reference:
+        Bohmer W. et al. Deep Coordination Graphs.
+        https://arxiv.org/pdf/1910.00091.pdf
 
     Args:
         nodes (list[Node]): List of nodes in the graph
@@ -72,17 +71,18 @@ class DCG:
         iterations: int,
         state_hidden_dim: int,
     ) -> None:
+        super(DCG, self).__init__()
         self.nodes = nodes
         self.edges = edges
         self.n_actions = n_actions
         self.iterations = iterations
+        self.obs_dim = obs_dim
+        self.state_hidden_dim = state_hidden_dim
 
         self.n_nodes = len(self.nodes)
         self.n_edges = len(self.edges)
-        self.actions = torch.zeros(self.n_nodes, self.n_actions)
-        self.state = torch.zeros(1, self.n_nodes, state_hidden_dim)
         self.state_encoder = nn.GRU(
-            input_size=obs_dim + 1, hidden_size=state_hidden_dim
+            input_size=obs_dim + n_actions, hidden_size=state_hidden_dim
         )
 
         # create utility network
@@ -110,8 +110,11 @@ class DCG:
         Returns:
             torch.Tensor: The computed Q value
         """
+        # Convert onehot to ints
+        a = torch.max((a), dim=-1).indices
+
         # compute utility component
-        q = u[[i for i in range(len(a))], a].sum()
+        q = torch.sum(u[[i for i in range(self.n_nodes)], a])
 
         # compute payoff component
         for e_idx, (i, j) in enumerate(self.edges):
@@ -119,42 +122,42 @@ class DCG:
 
         return q
 
-    def forward(self, x: torch.Tensor) -> tuple(torch.Tensor, torch.Tensor):
-        """Compute the best set of actions given an observation
-
-        Args:
-            x (torch.Tensor): The observation
+    def compute_u(self, state: torch.Tensor) -> torch.Tensor:
+        """Compute the utility value for the current state.
 
         Returns:
-            tuple(torch.Tensor, torch.Tensor): The optimal actions and associated Q value
+            torch.Tensor: Computed utility value
         """
-        # encode observation and previous actions into hidden state
-        encoder_input = torch.cat([x.unsqueeze(0), self.actions.unsqueeze(0)], dim=-1)
-        _, self.state = self.state_encoder(encoder_input, self.state)
+        return (1 / self.n_nodes) * self.utility(state).view(-1, self.n_nodes, self.n_actions)
 
-        # compute utility values for all nodes
-        u = (1 / self.n_nodes) * self.utility(self.state)
+    def compute_p(self, state: torch.Tensor) -> torch.Tensor:
+        """Compute the payoff value for the current state.
 
-        # compute payoff values for all nodes
+        Returns:
+            torch.Tensor: Computed payoff value
+        """
         p = []
         for i, j in self.edges:
             # compute payoffs for each edge
-            p_i_j = (1 / self.n_edges) * self.payoff(self.state[[i, j]].view(-1)).view(
-                self.n_actions, self.n_actions
+            p_i_j = (1 / self.n_edges) * self.payoff(state[0][0][[i, j]].view(-1)).view(
+                -1, self.n_actions, self.n_actions
             )
-            p_j_i = (1 / self.n_edges) * self.payoff(self.state[[j, i]].view(-1)).view(
-                self.n_actions, self.n_actions
+            p_j_i = (1 / self.n_edges) * self.payoff(state[0][0][[j, i]].view(-1)).view(
+                -1, self.n_actions, self.n_actions
             )
             # compute avergae of both ways for symetry and permuation invariance
-            p[i].append((p_i_j + p_j_i) / 2)
-        p = torch.stack(p)
+            p.append((p_i_j + p_j_i) / 2)
 
+        return torch.stack(p)
+
+    def message_passing(self, u: torch.Tensor, p: torch.Tensor) -> tuple(torch.Tensor, torch.Tensor):
         # run message passing across the graph
+        optimal_a = torch.zeros(self.n_nodes, self.n_actions)
         q_max = torch.zeros(1)
         for _ in range(self.iterations):
 
             # message passing is not backpropogated through
-            with torch.no_grad:
+            with torch.no_grad():
                 for e_idx, (i, j) in enumerate(self.edges):
                     # compute message for i --> j
                     m_i_j = (
@@ -170,8 +173,8 @@ class DCG:
                         u[j] + torch.sum(self.nodes[j].m, dim=0) - self.nodes[j].m[i]
                     )
                     m_j_i = m_j_i + p[e_idx]
-                    m_i_j = torch.max(m_j_i, dim=0).values
-                    m_i_j -= m_j_i.mean()
+                    m_j_i = torch.max(m_j_i, dim=0).values
+                    m_j_i -= m_j_i.mean()
                     self.nodes[i].new_m[j] = m_j_i
 
                 # update the messages for for all nodes
@@ -179,7 +182,7 @@ class DCG:
                     n.m = n.new_m
 
                 # compute optimal action for all nodes and q value according to messages
-                a = torch.zeros_like(self.actions)
+                a = torch.zeros(self.n_nodes, self.n_actions)
                 for i, n_i in enumerate(self.nodes):
                     n_i.a = torch.argmax(
                         (u[i] + torch.sum(n_i.m, dim=0)).view(-1), dim=0
@@ -190,9 +193,37 @@ class DCG:
             q_real = self.q(u, p, a)
             if q_real > q_max:
                 q_max = q_real
-                self.actions = a
+                optimal_a = a
 
-        return self.actions, q_max
+        return optimal_a, q_max
+
+    def forward(self, x: torch.Tensor, state: torch.Tensor, prev_action: torch.Tensor) -> tuple(torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor):
+        """Compute the best set of actions given an observation
+
+        Args:
+            x (torch.Tensor): The observation
+            state (torch.Tensor): The state of the system
+            prev_action (torch.Tensor): Previous action
+
+        Returns:
+            tuple(torch.Tensor, torch.Tensor): The optimal actions and associated Q value
+        """
+        # encode observation and previous actions into hidden state
+        print(state.shape)
+        encoder_input = torch.cat([x.view(1, -1, self.obs_dim), prev_action.view(1, -1, self.n_actions)], dim=-1)
+        _, state = self.state_encoder(encoder_input, state.view(1, -1, self.state_hidden_dim))
+        state = state.view(-1, 1, self.n_nodes, self.state_hidden_dim)
+
+        # compute utility values for all nodes
+        u = self.compute_u(state)
+
+        # compute payoff values for all nodes
+        p = self.compute_p(state)
+
+        # run message passing and compute optimal actions
+        a, q_max = self.message_passing(u, p)
+
+        return a, q_max, u, p, state
 
     def _create_mlp(self, hidden_dims: list[int]) -> nn.Module:
         """Create MLP with given dimensions
@@ -212,53 +243,52 @@ class DCG:
 
 
 class DCGAgent:
-    def __init__(self, env, graph, hp):
+    """Q learning agent using DCGs to generate Q values for a MARL system.
+
+    Args:
+        env: MARL Environment
+        nodes: List[Node]: List of nodes representing indivisual agents
+        edges: List[Tuple[int, int]]: List of tuples denoting edges
+    """
+    def __init__(self, env, nodes, edges, hp):
         self.env = env
-        self.dcg = DCG(
-            nodes=graph["nodes"],
-            edges=graph["edges"],
-            utility_hidden_dims=[128],
-            payoff_hidden_dims=[256],
-            obs_dim=18,
-            n_actions=5,
-            iterations=10,
-            state_hidden_dim=128,
-        )
         self.hp = hp
-        self.utility_targ = copy.deepcopy(self.dcg.utility)
-        self.payoff_targ = copy.deepcopy(self.dcg.payoff)
+        self.dcg = DCG(
+            nodes=nodes,
+            edges=edges,
+            utility_hidden_dims=hp["utility_hidden_dims"],
+            payoff_hidden_dims=hp["payoff_hidden_dims"],
+            obs_dim=env.observation_space[0].shape[0],
+            n_actions=env.action_space[0].n,
+            iterations=hp["iterations"],
+            state_hidden_dim=hp["state_hidden_dim"],
+        )
+        self.target_dcg = copy.deepcopy(self.dcg)
+        for p in self.target_dcg.parameters():
+            p.requires_grad = False
 
     def _update_params(self, replay_buffer, optim):
         # Randomly sample from the replay buffer
         sample = random.sample(replay_buffer, self.hp["batch_size"])
-        obss = torch.stack([row[0] for row in sample])
-        actions = torch.stack([row[1].long() for row in sample])
-        rewards = torch.stack([row[2] for row in sample])
-        dones = torch.stack([row[3] for row in sample])
-        next_obs = torch.stack([row[4] for row in sample])
+        prev_actions, states, obss, actions, rewards, dones, next_obs, next_states = [torch.stack(i) for i in zip(*sample)]
 
+        # Compute target q values
         with torch.no_grad():
-            target_qs = rewards + self.hp["gamma"] * torch.argmax(
-                self.utility_targ.forward(next_obs)[-1]
-            ) * (~dones)
-        qs = self.dcg.utility.foward(obss)[actions]
-        loss = nn.MSELoss()(target_qs, qs)
+            a, _, u, p, _ = self.dcg(next_obs, next_states, actions)
+            target_q = rewards + self.hp["gamma"] * self.target_dcg.q(u, p, a) * (~dones)
+
+        # Update params by backprop
+        _, _, u, p, _ = self.dcg(obss, states, prev_actions)
+        q = self.dcg.q(u, p, actions)
+        loss = nn.MSELoss()(target_q, q)
         optim.zero_grad()
         loss.backward()
         optim.step()
 
         # Update using polyak averaging for some given interval
         with torch.no_grad():
-            # Utility network
             for p_target, p in zip(
-                self.utility_targ.parameters(), self.dcg.utility.parameters(),
-            ):
-                p_target.data.mul_(self.hp["polyak_const"])
-                p_target.data.add_((1 - self.hp["polyak_const"]) * p.data)
-
-            # Payoff network
-            for p_target, p in zip(
-                self.payoff_targ.parameters(), self.dcg.payoff.parameters()
+                self.target_dcg.parameters(), self.dcg.parameters(),
             ):
                 p_target.data.mul_(self.hp["polyak_const"])
                 p_target.data.add_((1 - self.hp["polyak_const"]) * p.data)
@@ -270,7 +300,7 @@ class DCGAgent:
         optim = torch.optim.Adam(
             [
                 {"params": self.dcg.utility.parameters(), "lr": self.hp["utility_lr"]},
-                {"params": self.dcg.payoff.parameters(), "lr": self.hp["payoff_hpam"]},
+                {"params": self.dcg.payoff.parameters(), "lr": self.hp["payoff_lr"]},
             ]
         )
 
@@ -280,21 +310,26 @@ class DCGAgent:
 
         for _ in range(episodes):
             eps_rewards = []
-            obs = self.env.reset_world()
+            obs = self.env.reset()
             obs = torch.tensor(obs, dtype=torch.float32)
             d = False
 
+            prev_actions = torch.zeros(self.env.n, env.action_space[0].n)
+            state = torch.zeros(1, 1, self.env.n, hp["state_hidden_dim"])
+
             # Collect trajectory
-            print("---Collecting Experience---")
+            print("Collecting Experience ...")
             for j in count():
                 step_count += 1
-                a = self.select_action(obs)
-                next_obs, r, d, _ = self.env.step(a)
-                eps_rewards.append(r)
+                a, _, _, _, next_state = self.dcg(obs, state, prev_actions)
+                next_obs, r, d, _ = self.env.step(a.to(int))
+                eps_rewards.append(sum(r))
                 next_obs = torch.tensor(next_obs, dtype=torch.float32)
-                r = torch.tensor(r, dtype=torch.float32)
-                d = torch.tensor(d, dtype=torch.float32)
-                replay_buffer.append((obs, a, r, d, next_obs))
+                r = torch.tensor(r, dtype=torch.float32).sum()
+                d = torch.tensor(d, dtype=torch.float32).sum()
+                replay_buffer.append((prev_actions, state, obs, a, r, d, next_obs, next_state))
+                prev_actions = a
+                state = next_state
 
                 rewards.append(sum(eps_rewards))
                 if (step_count >= self.hp["update_after"]) and (
@@ -316,10 +351,6 @@ class DCGAgent:
         # Load the networks
         pass
 
-    def select_action(self, obs: torch.Tensor):
-        # Should we add epsilon greedy exploration??
-        return self.dcg.forward(obs)
-
     def eval(self, episodes):
         print(f"Evaluating for {episodes} episodes")
         start = datetime.now()
@@ -335,7 +366,7 @@ class DCGAgent:
                 #        self.env.render()
 
                 obs = torch.tensor(obs, dtype=torch.float32)
-                a, _ = self.dcg.forward(obs)
+                a, _, _, _ = self.dcg.forward(obs)
                 obs, reward, done, _ = self.env.step(a)
                 episode_rewards.append(reward)
                 obs = torch.tensor(obs)
@@ -359,17 +390,24 @@ if __name__ == "__main__":
         world, scenario.reset_world, scenario.reward, scenario.observation
     )
 
+    hp = {
+        "utility_hidden_dims": [64],
+        "payoff_hidden_dims": [64],
+        "state_hidden_dim": 64,
+        "iterations": 10,
+        "utility_lr": 1e-3,
+        "payoff_lr": 1e-3,
+        "batch_size": 64,
+        "gamma": 0.99,
+        "polyack_const": 0.9,
+        "max_buffer_length": 2000,
+        "max_traj_length": 200,
+        "update_after": 100,
+        "update_every": 5,
+    }
+
     n_actions = env.action_space[0].n
     nodes = [Node(env.n, n_actions) for _ in range(env.n)]
     edges = [(0, 1), (0, 2), (1, 2)]
-    agent = DCG(
-        nodes,
-        edges,
-        utility_hidden_dims=32,
-        payoff_hidden_dims=32,
-        obs_dim=env.observation_space,
-        n_actions=n_actions,
-        iterations=20,
-        state_hidden_dim=32
-    )
+    agent = DCGAgent(env, nodes, edges, hp)
     agent.train(20)
