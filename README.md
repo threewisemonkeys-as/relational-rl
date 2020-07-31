@@ -55,3 +55,4 @@ optional arguments:
 ## References
 
 1. Zambaldi, V., David R., Santoro A. et al. [Deep reinforcement learning with relational inductive biases](https://openreview.net/pdf?id=HkxaFoC9KQ). ICLR 2019.
+2. Bohmer W. et al. [Deep Coordination Graphs](https://arxiv.org/abs/1910.00091)
